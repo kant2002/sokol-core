@@ -1,0 +1,9 @@
+/target/
+**/target/
+.zig-cache/
+zig-out/
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
