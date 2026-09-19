@@ -1,19 +1,30 @@
 #![allow(dead_code)]
-
+pub use mesh_sync::{AlertLevel, MeshCommand, MeshOrchestrator};
+pub mod cluster_state;
+mod mesh_sync;
+mod p2p;
 mod sokol;
 
 use aya::maps::lpm_trie::Key;
-use aya::maps::sock::SockMap;
-use aya::maps::{LpmTrie, MapData, PerCpuArray};
-use aya::programs::{SchedClassifier, TcAttachType, Xdp, tc};
+use aya::maps::{LpmTrie, MapData, PerCpuArray, RingBuf};
+use aya::programs::{tc, SchedClassifier, TcAttachType, Xdp};
 use aya::{include_bytes_aligned, Bpf, Pod};
 use clap::Parser;
 use sokol::SokolEngine;
-use std::net::Ipv4Addr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::net::IpAddr;
+use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::io::unix::AsyncFd;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::sync::{mpsc, watch};
+
+use common::atp::AtpBudgetController;
+use common::canonical::CanonicalParser;
+use common::{DropEvent, NodeTelemetry};
+
+use crate::cluster_state::BirdEyeView;
+use crate::p2p::{connect_to_peer, DagTracker, NodeCrypto, P2PNetwork, PeerRegistry};
 
 #[link(name = "sntl_db", kind = "static")]
 extern "C" {
@@ -23,7 +34,7 @@ extern "C" {
 }
 
 pub struct SentinelDb {
-    tx: mpsc::UnboundedSender<String>,
+    tx: std::sync::mpsc::Sender<String>,
 }
 
 impl SentinelDb {
@@ -34,28 +45,24 @@ impl SentinelDb {
         }
         log::info!("Zig DB Engine initialized successfully (v{})", Self::version());
 
-        let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
 
-        
         std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-            rt.block_on(async move {
-                while let Some(payload) = rx.recv().await {
-                    unsafe {
-                        sntl_db_append_request(payload.as_ptr(), payload.len());
-                    }
+            while let Ok(payload) = rx.recv() {
+                unsafe {
+                    sntl_db_append_request(payload.as_ptr(), payload.len());
                 }
-            });
+            }
+            log::info!("SentinelDb persistence thread terminated.");
         });
 
         Ok(Self { tx })
     }
 
     pub fn append(&self, data: String) {
-        let _ = self.tx.send(data);
+        if let Err(e) = self.tx.send(data) {
+            log::error!("Failed to enqueue log to SentinelDb: {}", e);
+        }
     }
 
     pub fn version() -> u32 {
@@ -83,6 +90,97 @@ struct Args {
 
     #[arg(long, default_value = "/var/lib/sokol/sntl_events.sntl")]
     db_path: String,
+
+    #[arg(long, default_value = "1")]
+    node_id: u64,
+
+    #[arg(long, default_value = "[::]:8080")]
+    p2p_bind: String,
+
+    #[arg(long, value_name = "PEER")]
+    seed_peer: Vec<String>,
+
+    #[arg(long, default_value = "[2001:db8:ffff::1]:179")]
+    upstream_router: String,
+
+    #[arg(long, default_value = "2001:db8:1000::/64")]
+    ipv6_prefix: String,
+}
+
+async fn push_telemetry(msg: &str) {
+    let telemetry_socket = "/run/sokol_telemetry.sock";
+    if let Ok(mut stream) = tokio::net::UnixStream::connect(telemetry_socket).await {
+        let _ = stream.write_all(msg.as_bytes()).await;
+        let _ = stream.flush().await;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn enforce_block_local(
+    ip: IpAddr,
+    reason: &str,
+    blocklist_v4: &Arc<tokio::sync::Mutex<LpmTrie<MapData, [u8; 4], u32>>>,
+    blocklist_v6: &Arc<tokio::sync::Mutex<LpmTrie<MapData, [u8; 16], u32>>>,
+    sntl_db: &Arc<SentinelDb>,
+    registry: &PeerRegistry,
+    node_id: u64,
+    node_crypto: &Arc<NodeCrypto>,
+    dag_tracker: &Arc<tokio::sync::Mutex<DagTracker>>,
+) {
+    match ip {
+        IpAddr::V4(v4) => {
+            let key = Key::new(32, v4.octets());
+            let insert_result = {
+                let mut map_guard = blocklist_v4.lock().await;
+                map_guard.insert(&key, 1u32, 0)
+            };
+
+            match insert_result {
+                Ok(_) => {
+                    log::warn!("[Local Security] Dynamic IPv4 block enforced in XDP: {} | Reason: {}", v4, reason);
+                    sntl_db.append(format!("DYNAMIC_BLOCK_V4|IP:{}|Reason:{}|Enforced", v4, reason));
+                    
+                    let telemetry_msg = format!("DROP_IMMEDIATE:{}\nDB_LOG:NODE={}|TIER=Tier1BotTarpit|IP={}|VEC={}\n", v4, node_id, v4, reason);
+                    push_telemetry(&telemetry_msg).await;
+
+                    let broadcast_cmd = MeshCommand::BlockIp {
+                        ip: v4.to_string(),
+                        reason: reason.to_string(),
+                    };
+                    let _ = registry.broadcast(&broadcast_cmd, node_id, node_crypto, dag_tracker).await;
+                }
+                Err(e) => {
+                    log::error!("[Local Security] Failed to insert IPv4 {} into eBPF: {:?}", v4, e);
+                }
+            }
+        }
+        IpAddr::V6(v6) => {
+            let key = Key::new(128, v6.octets());
+            let insert_result = {
+                let mut map_guard = blocklist_v6.lock().await;
+                map_guard.insert(&key, 1u32, 0)
+            };
+
+            match insert_result {
+                Ok(_) => {
+                    log::warn!("[Local Security] Dynamic IPv6 block enforced in XDP: {} | Reason: {}", v6, reason);
+                    sntl_db.append(format!("DYNAMIC_BLOCK_V6|IP:{}|Reason:{}|Enforced", v6, reason));
+
+                    let telemetry_msg = format!("DROP_IMMEDIATE:{}\nDB_LOG:NODE={}|TIER=Tier1BotTarpit|IP={}|VEC={}\n", v6, node_id, v6, reason);
+                    push_telemetry(&telemetry_msg).await;
+
+                    let broadcast_cmd = MeshCommand::BlockIp {
+                        ip: v6.to_string(),
+                        reason: reason.to_string(),
+                    };
+                    let _ = registry.broadcast(&broadcast_cmd, node_id, node_crypto, dag_tracker).await;
+                }
+                Err(e) => {
+                    log::error!("[Local Security] Failed to insert IPv6 {} into eBPF: {:?}", v6, e);
+                }
+            }
+        }
+    }
 }
 
 #[tokio::main]
@@ -90,7 +188,9 @@ async fn main() -> Result<(), anyhow::Error> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let args = Args::parse();
 
-    log::info!("Initializing Sokol-Core Production Daemon on interface: {}", args.interface);
+    log::info!("Initializing Sokol-Core Production Daemon on interface: {} [Node ID: {}]", args.interface, args.node_id);
+
+    let  atp_controller = AtpBudgetController::new(10_000_000);
 
     let sntl_db = Arc::new(SentinelDb::init(&args.db_path).map_err(|e| {
         anyhow::anyhow!("Failed to initialize sntl_db: {}", e)
@@ -99,16 +199,15 @@ async fn main() -> Result<(), anyhow::Error> {
     #[cfg(debug_assertions)]
     let mut bpf = Bpf::load(include_bytes_aligned!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../target/bpfel-unknown-none/debug/ebpf_probe"
+        "/../target/bpfel-unknown-none/debug/ebpf-probe"
     )))?;
 
     #[cfg(not(debug_assertions))]
     let mut bpf = Bpf::load(include_bytes_aligned!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../target/bpfel-unknown-none/release/ebpf_probe"
+        "/../target/bpfel-unknown-none/release/ebpf-probe"
     )))?;
 
-    
     let prog_mut = bpf
         .program_mut("sentinel_vfr_filter")
         .ok_or_else(|| anyhow::anyhow!("Critical: Program sentinel_vfr_filter not found in ELF"))?;
@@ -117,115 +216,526 @@ async fn main() -> Result<(), anyhow::Error> {
     let _link = program.attach(&args.interface, Default::default())?;
     log::info!("XDP program successfully locked and attached to interface: {}", args.interface);
 
-    
     let tc_prog_mut = bpf
         .program_mut("sentinel_vfr_tc")
         .ok_or_else(|| anyhow::anyhow!("Critical: Program sentinel_vfr_tc not found in ELF"))?;
     let tc_program: &mut SchedClassifier = tc_prog_mut.try_into()?;
-    let _qdisc = tc::qdisc_add_clsact(&args.interface)?;
+    tc::qdisc_add_clsact(&args.interface)?;
     tc_program.load()?;
     let _tc_link = tc_program.attach(&args.interface, TcAttachType::Ingress)?;
     log::info!("TC stateful VFR program successfully locked and attached to ingress of {}", args.interface);
 
-    let stats_map_data = bpf.take_map("STATS").ok_or_else(|| anyhow::anyhow!("STATS missing"))?;
-    let stats_map: PerCpuArray<MapData, BpfPacketStats> = PerCpuArray::try_from(stats_map_data)?;
+    std::fs::create_dir_all("/sys/fs/bpf/sokol").ok();
 
-    let blocklist_map_data = bpf.take_map("BLOCKLIST_V4").ok_or_else(|| anyhow::anyhow!("BLOCKLIST_V4 missing"))?;
-    let blocklist_map = Arc::new(tokio::sync::Mutex::new(LpmTrie::<MapData, [u8; 4], u32>::try_from(blocklist_map_data)?));
+    let blocklist_v4_data = bpf.take_map("BLOCKLIST_V4").ok_or_else(|| anyhow::anyhow!("BLOCKLIST_V4 missing"))?;
+    let blocklist_v4_trie = LpmTrie::<MapData, [u8; 4], u32>::try_from(blocklist_v4_data)?;
+    let blocklist_v4_map = Arc::new(tokio::sync::Mutex::new(blocklist_v4_trie));
 
-    let socket_map_data = bpf.take_map("SOCKET_MAP").ok_or_else(|| anyhow::anyhow!("SOCKET_MAP missing"))?;
-    let socket_map = Arc::new(tokio::sync::Mutex::new(SockMap::<MapData>::try_from(socket_map_data)?));
+    let blocklist_v6_data = bpf.take_map("BLOCKLIST_V6").ok_or_else(|| anyhow::anyhow!("BLOCKLIST_V6 missing"))?;
+    let blocklist_v6_trie = LpmTrie::<MapData, [u8; 16], u32>::try_from(blocklist_v6_data)?;
+    let blocklist_v6_map = Arc::new(tokio::sync::Mutex::new(blocklist_v6_trie));
 
-    for ip_str in &args.block {
-        if let Ok(ip) = ip_str.parse::<Ipv4Addr>() {
-            let key = Key::new(32, ip.octets());
-            blocklist_map.lock().await.insert(&key, 1u32, 0)?;
-            sntl_db.append(format!("STATIC_BLOCK|IP:{}|Action:XDP_DROP", ip));
+    let stats_map_data = bpf.take_map("STATS").ok_or_else(|| anyhow::anyhow!("STATS map missing"))?;
+    let stats_map = PerCpuArray::<MapData, BpfPacketStats>::try_from(stats_map_data)?;
+
+    if let Some(events_map_data) = bpf.take_map("EVENTS") {
+        match RingBuf::try_from(events_map_data) {
+            Ok(ring_buf) => {
+                match AsyncFd::new(ring_buf) {
+                    Ok(mut async_fd) => {
+                        let db_events = sntl_db.clone();
+                        let node_id_ev = args.node_id;
+                        tokio::spawn(async move {
+                            log::info!("[eBPF RingBuf] Active consumer loop attached for kernel drop events.");
+                            loop {
+                                match async_fd.readable_mut().await {
+                                    Ok(mut guard) => {
+                                        let rb = guard.get_inner_mut();
+                                        
+                                        while let Some(item) = rb.next() {
+                                            if item.len() >= std::mem::size_of::<DropEvent>() {
+                                                let event = unsafe { std::ptr::read_unaligned(item.as_ptr() as *const DropEvent) };
+                                                let log_msg = format!(
+                                                    "KERNEL_DROP_NOTIFY|Reason:{}|Proto:{}|Version:{}|PktLen:{}",
+                                                    event.reason, event.protocol, event.ip_version, event.pkt_len
+                                                );
+                                                db_events.append(log_msg.clone());
+                                                
+                                                let telemetry_msg = format!("DB_LOG:NODE={}|TIER=Tier1BotTarpit|IP=0.0.0.0|VEC={}\n", node_id_ev, log_msg);
+                                                push_telemetry(&telemetry_msg).await;
+                                            }
+                                        }
+                                        guard.clear_ready();
+                                    }
+                                    Err(e) => {
+                                        log::error!("[eBPF RingBuf] Failed to get readable guard: {}", e);
+                                        break;
+                                    }
+                                }
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        log::error!("[eBPF RingBuf] Failed to wrap ring buffer in AsyncFd: {}", e);
+                    }
+                }
+            }
+            Err(e) => {
+                log::error!("[eBPF RingBuf] Failed to create RingBuf from map data: {}", e);
+            }
         }
     }
 
-    let (cmd_tx, mut cmd_rx) = mpsc::channel::<Ipv4Addr>(100);
+    for ip_str in &args.block {
+        let clean_str = ip_str.trim();
+        if let Ok(ip) = clean_str.parse::<IpAddr>() {
+            match ip {
+                IpAddr::V4(v4) => {
+                    let key = Key::new(32, v4.octets());
+                    blocklist_v4_map.lock().await.insert(&key, 1u32, 0)?;
+                    sntl_db.append(format!("STATIC_BLOCK_V4|IP:{}|Action:XDP_DROP", v4));
+                    log::info!("[STATIC BLOCK] Enforced IPv4 block for CLI IP: {}", v4);
+                }
+                IpAddr::V6(v6) => {
+                    let key = Key::new(128, v6.octets());
+                    blocklist_v6_map.lock().await.insert(&key, 1u32, 0)?;
+                    sntl_db.append(format!("STATIC_BLOCK_V6|IP:{}|Action:XDP_DROP", v6));
+                    log::info!("[STATIC BLOCK] Enforced IPv6 block for CLI IP: {}", v6);
+                }
+            }
+        } else {
+            log::error!("[STATIC BLOCK] Invalid CLI --block IP argument: '{}'", ip_str);
+        }
+    }
 
-    for (idx, &port) in args.trap_port.iter().enumerate() {
-        let tx_trap = cmd_tx.clone();
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let shutdown_tx_ctrlc = shutdown_tx.clone();
+
+    ctrlc::set_handler(move || {
+        log::warn!("SIGINT received. Teardown initiated...");
+        let _ = shutdown_tx_ctrlc.send(true);
+    })?;
+
+    let peer_registry = PeerRegistry::new();
+    let (mesh_cmd_tx, mut mesh_cmd_rx) = mpsc::channel::<MeshCommand>(1000);
+
+    let node_crypto = Arc::new(NodeCrypto::new());
+    let dag_tracker = Arc::new(tokio::sync::Mutex::new(DagTracker::new()));
+
+    let p2p_bind_addr: std::net::SocketAddr = args.p2p_bind.parse().expect("Invalid P2P bind address");
+
+    let p2p_network = P2PNetwork::new(
+        p2p_bind_addr,
+        args.node_id,
+        node_crypto.clone(),
+        dag_tracker.clone(),
+        mesh_cmd_tx.clone(),
+        100,
+        shutdown_rx.clone(),
+        peer_registry.clone(),
+    );
+
+    tokio::spawn(async move {
+        if let Err(e) = p2p_network.run().await {
+            log::error!("[P2P] Network listener failed: {:?}", e);
+        }
+    });
+
+    for seed in &args.seed_peer {
+        if let Ok(seed_addr) = seed.trim().parse::<std::net::SocketAddr>() {
+            let reg_clone = peer_registry.clone();
+            let tx_clone = mesh_cmd_tx.clone();
+            let crypto_clone = node_crypto.clone();
+            let dag_clone = dag_tracker.clone();
+            let node_id = args.node_id;
+
+            tokio::spawn(async move {
+                log::info!("[P2P] Connecting to seed peer: {}", seed_addr);
+                if let Err(e) = connect_to_peer(
+                    seed_addr,
+                    node_id,
+                    crypto_clone,
+                    dag_clone,
+                    reg_clone,
+                    tx_clone,
+                ).await {
+                    log::warn!("[P2P] Failed to connect to seed peer {}: {:?}", seed_addr, e);
+                }
+            });
+        }
+    }
+
+    let bird_eye = BirdEyeView::new(0.5, Duration::from_secs(300));
+    let (_telemetry_tx, telemetry_rx) = mpsc::channel::<NodeTelemetry>(1000);
+
+    let blocklist_v4_mesh = blocklist_v4_map.clone();
+    let blocklist_v6_mesh = blocklist_v6_map.clone();
+    let sntl_db_mesh = sntl_db.clone();
+    let node_id_mesh = args.node_id;
+
+    tokio::spawn(async move {
+        while let Some(cmd) = mesh_cmd_rx.recv().await {
+            match cmd {
+                MeshCommand::BlockIp { ip, reason } => {
+                    let clean_ip = ip.trim();
+                    if let Ok(ip_addr) = clean_ip.parse::<IpAddr>() {
+                        match ip_addr {
+                            IpAddr::V4(v4) => {
+                                let key = Key::new(32, v4.octets());
+                                let insert_res = {
+                                    let mut map_guard = blocklist_v4_mesh.lock().await;
+                                    map_guard.insert(&key, 1u32, 0)
+                                };
+
+                                if let Err(e) = insert_res {
+                                    log::error!("[Mesh] Failed to insert IPv4 {} into eBPF: {:?}", v4, e);
+                                } else {
+                                    log::warn!("[Mesh] Synchronized IPv4 block for {} across mesh: {}", v4, reason);
+                                    sntl_db_mesh.append(format!("MESH_BLOCK_V4|IP:{}|Reason:{}", v4, reason));
+                                    
+                                    let telemetry_msg = format!("DB_LOG:NODE={}|TIER=Tier1_5Revenge|IP={}|VEC={}\n", node_id_mesh, v4, reason);
+                                    push_telemetry(&telemetry_msg).await;
+                                }
+                            }
+                            IpAddr::V6(v6) => {
+                                let key = Key::new(128, v6.octets());
+                                let insert_res = {
+                                    let mut map_guard = blocklist_v6_mesh.lock().await;
+                                    map_guard.insert(&key, 1u32, 0)
+                                };
+
+                                if let Err(e) = insert_res {
+                                    log::error!("[Mesh] Failed to insert IPv6 {} into eBPF: {:?}", v6, e);
+                                } else {
+                                    log::warn!("[Mesh] Synchronized IPv6 block for {} across mesh: {}", v6, reason);
+                                    sntl_db_mesh.append(format!("MESH_BLOCK_V6|IP:{}|Reason:{}", v6, reason));
+
+                                    let telemetry_msg = format!("DB_LOG:NODE={}|TIER=Tier1_5Revenge|IP={}|VEC={}\n", node_id_mesh, v6, reason);
+                                    push_telemetry(&telemetry_msg).await;
+                                }
+                            }
+                        }
+                    } else {
+                        log::error!("[Mesh] Received unparseable IP in BlockIp command: '{}'", ip);
+                    }
+                }
+                MeshCommand::UnblockIp { ip } => {
+                    let clean_ip = ip.trim();
+                    if let Ok(ip_addr) = clean_ip.parse::<IpAddr>() {
+                        match ip_addr {
+                            IpAddr::V4(v4) => {
+                                let key = Key::new(32, v4.octets());
+                                let mut map_guard = blocklist_v4_mesh.lock().await;
+                                let _ = map_guard.remove(&key);
+                                drop(map_guard);
+                                log::info!("[Mesh] Unblocked IPv4 {} per mesh command", v4);
+                            }
+                            IpAddr::V6(v6) => {
+                                let key = Key::new(128, v6.octets());
+                                let mut map_guard = blocklist_v6_mesh.lock().await;
+                                let _ = map_guard.remove(&key);
+                                drop(map_guard);
+                                log::info!("[Mesh] Unblocked IPv6 {} per mesh command", v6);
+                            }
+                        }
+                    } else {
+                        log::error!("[Mesh] Failed to parse IP for UnblockIp: '{}'", ip);
+                    }
+                }
+                MeshCommand::EngageDefense => {
+                    log::warn!("[CRITICAL] Global mesh defense mode engaged on node & upstream BGP Flowspec active!");
+                }
+                MeshCommand::DisengageDefense => {
+                    log::info!("[CRITICAL] Global mesh defense mode disengaged.");
+                }
+                MeshCommand::Alert { level, message } => {
+                    log::info!("[MESH ALERT {:?}] {}", level, message);
+                }
+            }
+        }
+    });
+
+    let upstream_router_addr: std::net::SocketAddr = args.upstream_router.parse().expect("Invalid upstream router address");
+    let mesh_orchestrator = MeshOrchestrator::new(
+        bird_eye,
+        telemetry_rx,
+        mesh_cmd_tx.clone(),
+        sntl_db.clone(),
+        shutdown_rx.clone(),
+        upstream_router_addr,
+        args.ipv6_prefix.clone(),
+    );
+
+    let mut orchestrator_task = mesh_orchestrator;
+    tokio::spawn(async move {
+        if let Err(e) = orchestrator_task.run_telemetry_processor().await {
+            log::error!("[Mesh] Orchestrator telemetry processor failed: {}", e);
+        }
+    });
+
+    for &port in &args.trap_port {
+        let blocklist_v4_trap = blocklist_v4_map.clone();
+        let blocklist_v6_trap = blocklist_v6_map.clone();
         let db_trap = sntl_db.clone();
-        let sock_map_clone = socket_map.clone();
+        let registry_trap = peer_registry.clone();
+
+        let crypto_trap = node_crypto.clone();
+        let dag_trap = dag_tracker.clone();
+        let node_id_trap = args.node_id;
+
         let bind_addr = format!("0.0.0.0:{}", port);
-        let map_index = idx as u32;
 
         tokio::spawn(async move {
-            if let Ok(listener) = tokio::net::TcpListener::bind(&bind_addr).await {
-                log::info!("[TRAP] Decoy TCP trap listening on port {}", port);
-                while let Ok((stream, peer)) = listener.accept().await {
-                    let ip = peer.ip();
-                    let v4_ip = match ip {
-                        std::net::IpAddr::V4(v4) => v4,
-                        _ => continue,
-                    };
+            match tokio::net::TcpListener::bind(&bind_addr).await {
+                Ok(listener) => {
+                    log::info!("[TRAP] Decoy TCP trap listening on port {}", port);
+                    loop {
+                        match listener.accept().await {
+                            Ok((_stream, peer)) => {
+                                let ip = peer.ip();
+                                log::warn!("[TRAP HIT] Unauthorized connection on port {} from {}", port, ip);
 
-                    log::warn!("[TRAP HIT] Unauthorized connection on port {} from {}", port, ip);
-
-                    let mut map = sock_map_clone.lock().await;
-                    if let Err(e) = map.set(map_index, &stream, 0) {
-                        log::error!("[SOCKMAP ERROR] Failed to insert socket into map: {}", e);
+                                let reason = format!("Decoy TCP trap hit on port {}", port);
+                                enforce_block_local(
+                                    ip,
+                                    &reason,
+                                    &blocklist_v4_trap,
+                                    &blocklist_v6_trap,
+                                    &db_trap,
+                                    &registry_trap,
+                                    node_id_trap,
+                                    &crypto_trap,
+                                    &dag_trap,
+                                ).await;
+                                db_trap.append(format!("TRAP_HIT|Port:{}|IP:{}|Action:EnforcedDrop", port, ip));
+                                
+                                let telemetry_msg = format!("DB_LOG:NODE={}|TIER=Tier1BotTarpit|IP={}|VEC={}\n", node_id_trap, ip, reason);
+                                push_telemetry(&telemetry_msg).await;
+                            }
+                            Err(e) => {
+                                log::error!("[TRAP] Accept error on port {}: {}. Retrying...", port, e);
+                                tokio::time::sleep(Duration::from_millis(100)).await;
+                            }
+                        }
                     }
-
-                    let _ = tx_trap.send(v4_ip).await;
-                    db_trap.append(format!("TRAP_HIT|Port:{}|IP:{}|Action:SockMapRedirect", port, ip));
+                }
+                Err(e) => {
+                    log::error!("[TRAP] Failed to bind decoy trap on port {}: {}", port, e);
                 }
             }
         });
     }
 
-    let map_clone = blocklist_map.clone();
-    let db_clone = sntl_db.clone();
+    let socket_path = "/run/sokol.sock";
+    let _ = std::fs::remove_file(socket_path);
+
+    let unix_listener = tokio::net::UnixListener::bind(socket_path)
+        .map_err(|e| anyhow::anyhow!("Failed to bind Unix socket at {}: {}", socket_path, e))?;
+    
+    std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o666))?;
+
+    let blocklist_v4_unix = blocklist_v4_map.clone();
+    let blocklist_v6_unix = blocklist_v6_map.clone();
+    let db_unix = sntl_db.clone();
+    let registry_unix = peer_registry.clone();
+
+    let crypto_unix = node_crypto.clone();
+    let dag_unix = dag_tracker.clone();
+    let node_id_unix = args.node_id;
+
     tokio::spawn(async move {
-        while let Some(ip_to_block) = cmd_rx.recv().await {
-            let key = Key::new(32, ip_to_block.octets());
-            if map_clone.lock().await.insert(&key, 1u32, 0).is_ok() {
-                log::info!("Dynamic runtime block enforced for IP: {}", ip_to_block);
-                db_clone.append(format!("DYNAMIC_BLOCK|IP:{}|Enforced", ip_to_block));
+        log::info!("[UNIX SOCKET] Listening for trap events on {}", socket_path);
+        loop {
+            match unix_listener.accept().await {
+                Ok((stream, _)) => {
+                    let blocklist_v4 = blocklist_v4_unix.clone();
+                    let blocklist_v6 = blocklist_v6_unix.clone();
+                    let db = db_unix.clone();
+                    let registry = registry_unix.clone();
+
+                    let crypto_stream = crypto_unix.clone();
+                    let dag_stream = dag_unix.clone();
+
+                    tokio::spawn(async move {
+                        let mut reader = BufReader::new(stream);
+                        let mut line = String::new();
+
+                        loop {
+                            line.clear();
+                            match reader.read_line(&mut line).await {
+                                Ok(0) => break,
+                                Ok(_) => {
+                                    let content = line.trim();
+                                    if content.is_empty() {
+                                        continue;
+                                    }
+
+                                    if content.starts_with('{') {
+                                        if let Err(e) = CanonicalParser::validate_strict_json_object(content) {
+                                            log::error!("[CANONICAL FAULT] Rejected malformed IPC payload: {:?}", e);
+                                            continue;
+                                        }
+                                    }
+
+                                    if let Some(raw_ip_str) = content.strip_prefix("DROP_IMMEDIATE:") {
+                                        let clean_ip_str = raw_ip_str.trim();
+                                        match clean_ip_str.parse::<IpAddr>() {
+                                            Ok(ip) => {
+                                                log::warn!("[XDP_ACTION] Trap triggered ban for IP: {}", ip);
+                                                enforce_block_local(
+                                                    ip,
+                                                    "Unix IPC DROP_IMMEDIATE trigger",
+                                                    &blocklist_v4,
+                                                    &blocklist_v6,
+                                                    &db,
+                                                    &registry,
+                                                    node_id_unix,
+                                                    &crypto_stream,
+                                                    &dag_stream,
+                                                ).await;
+                                            }
+                                            Err(e) => {
+                                                log::error!(
+                                                    "[UNIX IPC FAULT] Failed to parse IP from 'DROP_IMMEDIATE:{}': {}",
+                                                    raw_ip_str,
+                                                    e
+                                                );
+                                            }
+                                        }
+                                    } else if let Some(raw_ip_str) = content.strip_prefix("APT_HIGH_PRIORITY:") {
+                                        let clean_ip_str = raw_ip_str.trim();
+                                        match clean_ip_str.parse::<IpAddr>() {
+                                            Ok(ip) => {
+                                                log::warn!("[APT_ALERT] High-priority stager from IP: {}", ip);
+                                                db.append(format!("APT_HIGH_PRIORITY|IP:{}|Enforced", ip));
+                                                
+                                                let telemetry_msg = format!("DB_LOG:NODE={}|TIER=Tier2AptSandbox|IP={}|VEC=APT High-Priority Stager\n", node_id_unix, ip);
+                                                push_telemetry(&telemetry_msg).await;
+
+                                                enforce_block_local(
+                                                    ip,
+                                                    "Unix IPC APT_HIGH_PRIORITY stager",
+                                                    &blocklist_v4,
+                                                    &blocklist_v6,
+                                                    &db,
+                                                    &registry,
+                                                    node_id_unix,
+                                                    &crypto_stream,
+                                                    &dag_stream,
+                                                ).await;
+                                            }
+                                            Err(e) => {
+                                                log::error!(
+                                                    "[UNIX IPC FAULT] Failed to parse IP from 'APT_HIGH_PRIORITY:{}': {}",
+                                                    raw_ip_str,
+                                                    e
+                                                );
+                                            }
+                                        }
+                                    } else if let Some(log_content) = content.strip_prefix("DB_LOG:") {
+                                        db.append(log_content.trim().to_string());
+                                        let telemetry_msg = format!("DB_LOG:NODE={}|{}\n", node_id_unix, log_content.trim());
+                                        push_telemetry(&telemetry_msg).await;
+                                    }
+                                }
+                                Err(e) => {
+                                    log::error!("[UNIX SOCKET] Error reading IPC stream: {}", e);
+                                    break;
+                                }
+                            }
+                        }
+                    });
+                }
+                Err(e) => {
+                    log::error!("[UNIX SOCKET] Accept error: {}. Retrying...", e);
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
             }
         }
     });
-
-    let running = Arc::new(AtomicBool::new(true));
-    let r = running.clone();
-    ctrlc::set_handler(move || {
-        log::warn!("Shutdown signal received. Teardown initiated...");
-        r.store(false, Ordering::SeqCst);
-    })?;
 
     let sokol_engine = SokolEngine::new(500.0);
     let mut prev_packets = 0;
     let mut prev_bytes = 0;
 
-    while running.load(Ordering::SeqCst) {
-        tokio::time::sleep(Duration::from_secs(1)).await;
+    log::info!("Sokol-Core running with SokolEngine anomaly detection & sovereign mesh verification loops.");
 
-        let mut total_rx_packets = 0u64;
-        let mut total_rx_bytes = 0u64;
-        let mut total_dropped = 0u64;
+    let mut ticker = tokio::time::interval(Duration::from_secs(1));
+    let mut shutdown_rx_loop = shutdown_rx.clone();
+    let node_id_hb = args.node_id;
+    let p2p_bind_hb = args.p2p_bind.clone();
 
-        if let Ok(values) = stats_map.get(&0u32, 0) {
-            total_rx_packets = values.iter().map(|v| v.0.rx_packets).sum();
-            total_rx_bytes = values.iter().map(|v| v.0.rx_bytes).sum();
-            total_dropped = values.iter().map(|v| v.0.dropped_packets).sum();
+    loop {
+        tokio::select! {
+            _ = shutdown_rx_loop.changed() => {
+                if *shutdown_rx_loop.borrow() {
+                    log::info!("Initiating main loop shutdown sequence...");
+                    break;
+                }
+            }
+
+            _ = ticker.tick() => {
+                atp_controller.reset();
+
+                let hb_msg = format!("HEARTBEAT:ID={}|NAME=Sokol-Node-{}|EP={}|MODE=NORMAL\n", node_id_hb, node_id_hb, p2p_bind_hb);
+                push_telemetry(&hb_msg).await;
+
+                if !atp_controller.try_consume(250) {
+                    log::warn!("[ATP THROTTLE] Execution budget exceeded for current tick, skipping heavy analytical cycle.");
+                    continue;
+                }
+
+                let mut total_rx_packets = 0u64;
+                let mut total_rx_bytes = 0u64;
+                let mut total_dropped = 0u64;
+
+                if let Ok(per_cpu_stats) = stats_map.get(&0u32, 0) {
+                    for cpu_stat in per_cpu_stats.iter() {
+                        total_rx_packets += cpu_stat.0.rx_packets;
+                        total_rx_bytes += cpu_stat.0.rx_bytes;
+                        total_dropped += cpu_stat.0.dropped_packets;
+                    }
+                }
+
+                let delta_packets = total_rx_packets.saturating_sub(prev_packets);
+                let delta_bytes = total_rx_bytes.saturating_sub(prev_bytes);
+
+                let dt = 1.0;
+                let is_anomaly = sokol_engine.detect_anomaly(
+                    total_rx_packets as f64,
+                    prev_packets as f64,
+                    dt,
+                ).unwrap_or_default();
+
+                let flow_rate = SokolEngine::compute_flow_rate(delta_packets, dt);
+
+                prev_packets = total_rx_packets;
+                prev_bytes = total_rx_bytes;
+
+                if is_anomaly || total_dropped > 0 {
+                    log::warn!(
+                        "[SOKOL ANOMALY DETECTED] Flow Rate: {:.2} pkts/s | Pkts/s: {} | Bytes/s: {} | Drops: {}",
+                        flow_rate.0, delta_packets, delta_bytes, total_dropped
+                    );
+                    
+                    let anomaly_telemetry = format!(
+                        "DB_LOG:NODE={}|TIER=Tier3AiAnomaly|IP=0.0.0.0|VEC=Anomaly detected, flow rate {:.2}\n",
+                        node_id_hb, flow_rate.0
+                    );
+                    push_telemetry(&anomaly_telemetry).await;
+                }
+
+                let telemetry_stat = format!(
+                    "STAT:NODE={}|RX_PKTS={}|RX_BYTES={}|DROPPED={}|FLOW={:.2}\n",
+                    node_id_hb, total_rx_packets, total_rx_bytes, total_dropped, flow_rate.0
+                );
+                push_telemetry(&telemetry_stat).await;
+            }
         }
-
-        let pps = total_rx_packets.saturating_sub(prev_packets);
-        let bps = total_rx_bytes.saturating_sub(prev_bytes);
-
-        if let Ok(true) = sokol_engine.detect_anomaly(total_rx_packets as f64, prev_packets as f64, 1.0) {
-            log::warn!("SOKOL ALERT: Packet storm detected! PPS: {}", pps);
-            sntl_db.append(format!("STORM_ALERT|PPS:{}|Dropped:{}", pps, total_dropped));
-        }
-
-        prev_packets = total_rx_packets;
-        prev_bytes = total_rx_bytes;
-
-        log::info!("METRICS | PPS: {} | BPS: {} | Total RX: {} | Dropped: {}", pps, bps, total_rx_packets, total_dropped);
     }
+
+    log::info!("Sokol-Core main loop terminated gracefully. Cleaning up resources...");
+    let _ = std::fs::remove_file(socket_path);
 
     Ok(())
 }

@@ -1,68 +1,51 @@
 # Sokol-Core 🛡️
 
-> 🚧 **Project Status:** Experimental / Under Active Development
+> **Status:** Pilot / Active Testing
 
-High-performance, kernel-level network security and traffic filtering daemon built with **Rust**, **Aya (eBPF/XDP)**, and **Zig**.
+A high-performance network security and traffic filtering system running at the Linux kernel level. Built with **Rust** (eBPF/XDP) and **Zig**.
 
-`sokol-core` is engineered to operate at line rate, intercepting and mitigating packet storms, volumetric attacks, and unauthorized traffic directly at the network driver level via eBPF XDP (eXpress Data Path), while leveraging a high-speed embedded database written in Zig for state management and metrics.
+The program intercepts and drops garbage (attacks, malicious traffic) right at the network interface card before it even reaches the OS. For internal states and logs, it uses a custom high-speed database written in Zig (`sntl_db`).
 
 ---
 
-## Architecture & Technology Stack
-
-- **Data Plane (eBPF/XDP):** Written in Rust using the `aya-ebpf` framework, compiled for `bpfel-unknown-none` to execute safely inside the Linux kernel network stack.
-- **Control Plane / Orchestrator:** A robust Rust service managing lifecycle, telemetry, and dynamic policy updates.
-- **Storage & Metrics Engine (`sntl_db`):** A custom, memory-optimized database written in Zig, integrated via FFI to store security events, telemetry, and dynamic IP blocklists with minimal latency.
-```text
-┌──────────────────────────────────────────────┐
-│           Network Interface (NIC)            │
-└──────────────────────┬───────────────────────┘
-│ XDP Hook (Line Rate)
-▼
-┌───────────────────────────┐
-│   eBPF XDP Probe (Rust)   │ ◄─── Dynamic Blocklists
-└─────────────┬─────────────┘
-│ Perf Events / Ring Buffer
-▼
-┌───────────────────────────┐
-│  Orchestrator Daemon (Rs) │
-└─────────────┬─────────────┘
-│ FFI / Storage
-▼
-┌───────────────────────────┐
-│    Zig Storage (sntl_db)│
-└───────────────────────────┘
-## Key Features
-
-- **Line-Rate Mitigation:** Drops malicious packets at the earliest possible point in the Linux network stack.
-- **Dynamic Policy Enforcement:** Real-time updates of IP blocklists without kernel reloads or downtime.
-- **Zero-Allocation Data Path:** Designed for predictability and ultra-low latency under heavy packet loads.
-
 ## Requirements
 
-- **OS:** Linux kernel 5.15+ (with XDP-compatible NIC driver)
+- **OS:** Linux kernel 5.15+ (with an XDP-compatible NIC driver)
 - **Toolchain:** 
-  - Rust Nightly (for `-Zbuild-std=core` eBPF compilation)
+  - Rust Nightly (needed for building eBPF target `bpfel-unknown-none`)
   - Zig compiler (v0.11+)
-  - `make`, `clang`
+  - `clang`, `llvm`
 
-## Quick Start & Build
+---
+
+## Build & Run
+
+Clone the repository:
 
 ```bash
 git clone [https://github.com/ValkyrieSentinel/sokol-core.git](https://github.com/ValkyrieSentinel/sokol-core.git)
 cd sokol-core
-make all
-To run the orchestrator (requires root privileges for XDP map attachment):
+Build the database in Zig (sntl_db):
 
 Bash
-sudo ./target/release/orchestratorProject Structure
-ebpf/ — Low-level XDP program running in kernel space.
+cd sntl_db && zig build -O ReleaseFast && cd ..
+Build eBPF and the orchestrator in Rust:
 
-orchestrator/ — User-space daemon managing eBPF maps and monitoring.
+Bash
+cargo +nightly build --release
+Run (must be run with sudo, as root privileges are required to work with XDP maps and network interfaces):
 
-sntl_db/ — High-performance Zig storage engine for security events.
+Bash
+sudo ./target/release/orchestrator
+Project Structure
+ebpf/ — kernel space code (Rust XDP program).
 
-common/ — Shared data structures and protocol definitions.
+orchestrator/ — main user-space daemon managing maps and logic.
+
+sntl_db/ — fast Zig database for events and metrics.
+
+common/ — shared data structures and protocol definitions.
 
 License
-Distributed under the MIT License. See LICENSE for more information.
+Copyright © Sokol-Core Contributors. All rights reserved.
+Unauthorized copying, distribution, or use of this code is strictly prohibited without permission from the author.

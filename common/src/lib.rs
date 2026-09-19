@@ -1,15 +1,12 @@
-#![no_std]
+#![cfg_attr(not(feature = "std"), no_std)]
 
-pub mod drop_reason {
-    pub const STATIC_BLOCK: u16 = 1;
-    pub const FAST_PATH_HIT: u16 = 2;
-    pub const SLOW_PATH_LPM_HIT: u16 = 3;
-    pub const VFR_ANOMALY: u16 = 4;
-    pub const MALFORMED_HEADER: u16 = 5;
-    pub const TRAP_INTERCEPTED: u16 = 6;
-    pub const SOCK_REDIRECTED: u16 = 7;
-    pub const MANUAL_BLOCK: u16 = 8;
-}
+#[cfg(feature = "std")]
+extern crate std;
+
+pub use core::sync::atomic::AtomicU64;
+
+pub const MAX_PAYLOAD: usize = 256;
+pub const HASH_SIZE: usize = 32;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -44,39 +41,39 @@ pub struct DropEvent {
     pub reason: u16,
     pub protocol: u8,
     pub ip_version: u8,
-}
-
-#[repr(C, packed)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct LpmKeyV4 {
-    pub prefixlen: u32,
-    pub data: [u8; 4],
-}
-
-#[repr(C, packed)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct LpmKeyV6 {
-    pub prefixlen: u32,
-    pub data: [u8; 16],
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct IpcBlockCommand {
-    pub src_ip: [u8; 16],
-    pub duration_secs: u32, 
-    pub reason: u16,
-    pub ip_version: u8,     
-    pub _pad: u8,           
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ForensicHeader {
-    pub page_id: u32,
-    pub timestamp_epoch: u64,
-    pub src_ip: [u8; 16],
     pub payload_len: u16,
-    pub reason: u16,
-    pub _pad: u32,
+    pub _pad: u16,
+    pub payload: [u8; MAX_PAYLOAD],
 }
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct NodeTelemetry {
+    pub node_id: u64,
+    pub rx_packets: u64,
+    pub dropped_packets: u64,
+    pub anomaly_score: f64,
+    pub under_attack: u8,
+    pub has_attacker_ip: u8,
+    pub attacker_ip: [u8; 16],
+    pub _pad: [u8; 6],
+}
+
+pub mod drop_reason {
+    pub const STATIC_BLOCK: u16 = 1;
+    pub const FAST_PATH_HIT: u16 = 2;
+    pub const SLOW_PATH_LPM_HIT: u16 = 3;
+    pub const VFR_ANOMALY: u16 = 4;
+    pub const MALFORMED_HEADER: u16 = 5;
+    pub const TRAP_INTERCEPTED: u16 = 6;
+    pub const SOCK_REDIRECTED: u16 = 7;
+    pub const MANUAL_BLOCK: u16 = 8;
+}
+
+pub mod atp;
+pub mod canonical;
+pub mod crypto;
+pub mod dag;
+
+#[cfg(feature = "std")]
+pub mod pqc;

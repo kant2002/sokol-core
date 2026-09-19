@@ -1,12 +1,13 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::net::Ipv4Addr;
 use std::path::Path;
 use std::process::Command;
 use std::thread;
 use std::time::Duration;
 
-const DB_FILE: &str = "sokol_audit.sntl";
+const DB_FILE: &str = "/var/lib/sokol/sntl_events.sntl";
 const MAGIC: u32 = 0x534E544C;
 const PAGE_SIZE: usize = 4096;
 const HEADER_SIZE: usize = 64;
@@ -17,93 +18,143 @@ struct AuditEvent {
     ip: String,
     tier: String,
     payload_len: String,
+    payload_snippet: String,
     #[allow(dead_code)]
     raw: String,
 }
 
-fn parse_db() -> io::Result<Vec<AuditEvent>> {
+fn read_new_events(
+    file: &mut Option<File>,
+    current_pos: &mut u64,
+    events: &mut Vec<AuditEvent>,
+) -> io::Result<()> {
     let path = Path::new(DB_FILE);
     if !path.exists() {
-        return Ok(Vec::new());
+        *current_pos = 0;
+        events.clear();
+        *file = None;
+        return Ok(());
     }
 
-    let mut file = File::open(path)?;
-    let file_size = file.metadata()?.len();
-    let mut events = Vec::new();
-    let mut buffer = vec![0u8; PAGE_SIZE];
+    if file.is_none() {
+        *file = Some(File::open(path)?);
+    }
 
-    let mut current_pos = 0;
-    while current_pos < file_size {
-        file.seek(SeekFrom::Start(current_pos))?;
-        let n = file.read(&mut buffer)?;
+    let f = file.as_mut().unwrap();
+    let metadata = f.metadata()?;
+    let file_size = metadata.len();
+
+    if file_size < *current_pos {
+        *current_pos = 0;
+        events.clear();
+    }
+
+    if *current_pos >= file_size {
+        return Ok(());
+    }
+
+    f.seek(SeekFrom::Start(*current_pos))?;
+    let mut buffer = [0u8; PAGE_SIZE];
+
+    while *current_pos + (PAGE_SIZE as u64) <= file_size {
+        let n = f.read(&mut buffer)?;
         if n < PAGE_SIZE {
             break;
         }
 
-        let magic = u32::from_le_bytes(buffer[0..4].try_into().unwrap());
+        *current_pos += PAGE_SIZE as u64;
+
+        let magic = u32::from_le_bytes(buffer[0..4].try_into().unwrap_or([0; 4]));
         if magic != MAGIC {
-            current_pos += PAGE_SIZE as u64;
             continue;
         }
 
-        let page_id = u64::from_le_bytes(buffer[16..24].try_into().unwrap());
-        let data_len = u32::from_le_bytes(buffer[40..44].try_into().unwrap());
+        let page_id = u64::from_le_bytes(buffer[16..24].try_into().unwrap_or([0; 8]));
+        let data_len = u32::from_le_bytes(buffer[40..44].try_into().unwrap_or([0; 4]));
 
         let payload_end = HEADER_SIZE + data_len as usize;
         if payload_end <= PAGE_SIZE {
             let payload_bytes = &buffer[HEADER_SIZE..payload_end];
-            if let Ok(log_str) = String::from_utf8(payload_bytes.to_vec()) {
-                let mut ip = "Unknown".to_string();
-                let mut tier = "UNKNOWN".to_string();
-                let mut payload_len = "0".to_string();
 
-                for part in log_str.split('|') {
-                    if let Some(val) = part.strip_prefix("IP=") {
-                        ip = val.to_string();
-                    } else if let Some(val) = part.strip_prefix("TIER=") {
-                        tier = val.to_string();
-                    } else if let Some(val) = part.strip_prefix("LEN=") {
-                        payload_len = val.to_string();
-                    }
-                }
+            let log_str = String::from_utf8_lossy(payload_bytes)
+                .replace('\0', "")
+                .trim()
+                .to_string();
 
-                events.push(AuditEvent {
-                    page_id,
-                    ip,
-                    tier,
-                    payload_len,
-                    raw: log_str,
-                });
+            let mut ip = "Unknown".to_string();
+            let mut tier = "Event".to_string();
+            let mut payload_len = data_len.to_string();
+            let mut payload_snippet = String::new();
+
+            let parts: Vec<&str> = log_str.split('|').collect();
+            if let Some(first) = parts.first() {
+                tier = first.trim().to_string();
             }
-        }
 
-        current_pos += PAGE_SIZE as u64;
+            for part in &parts {
+                let part = part.trim();
+                if let Some(val) = part.strip_prefix("IP=") {
+                    ip = val.to_string();
+                } else if let Some(val) = part.strip_prefix("IP:") {
+                    ip = val.to_string();
+                } else if let Some(val) = part.strip_prefix("TIER=") {
+                    tier = val.to_string();
+                } else if let Some(val) = part.strip_prefix("LEN=") {
+                    payload_len = val.to_string();
+                } else if let Some(val) = part.strip_prefix("DATA=") {
+                    payload_snippet = val.to_string();
+                }
+            }
+
+            if ip == "Unknown" {
+                if let Some(found_ip) = log_str
+                    .split(|c: char| c.is_whitespace() || c == '|' || c == '=' || c == ',' || c == '"' || c == '\'')
+                    .map(|token| token.trim_matches(|c: char| !c.is_ascii_digit() && c != '.'))
+                    .find_map(|candidate| candidate.parse::<Ipv4Addr>().ok())
+                {
+                    ip = found_ip.to_string();
+                }
+            }
+
+            if payload_snippet.is_empty() {
+                payload_snippet = log_str.chars().take(30).collect();
+            }
+
+            events.push(AuditEvent {
+                page_id,
+                ip,
+                tier,
+                payload_len,
+                payload_snippet,
+                raw: log_str,
+            });
+        }
     }
 
-    Ok(events)
+    Ok(())
 }
 
 fn get_ebpf_active_blocks() -> Vec<String> {
-    let output = Command::new("sudo")
-        .args(["bpftool", "map", "dump", "name", "BLOCKLIST_V4"])
-        .output();
+    let output = Command::new("bpftool")
+        .args(["map", "dump", "name", "BLOCKLIST_V4"])
+        .output()
+        .or_else(|_| Command::new("sudo").args(["bpftool", "map", "dump", "name", "BLOCKLIST_V4"]).output());
 
     let mut banned_ips = Vec::new();
     if let Ok(out) = output {
         if out.status.success() {
             let stdout = String::from_utf8_lossy(&out.stdout);
             for line in stdout.lines() {
-                if line.contains("key:") {
-                    let parts: Vec<&str> = line.split("key:").collect();
-                    if parts.len() > 1 {
-                        let hex_bytes: Vec<u8> = parts[1]
-                            .split_whitespace()
-                            .filter_map(|s| u8::from_str_radix(s, 16).ok())
-                            .collect();
-                        if hex_bytes.len() >= 4 {
-                            let ip = format!("{}.{}.{}.{}", hex_bytes[0], hex_bytes[1], hex_bytes[2], hex_bytes[3]);
-                            banned_ips.push(ip);
-                        }
+                if let Some(idx) = line.find("key:") {
+                    let key_str = &line[idx + 4..];
+                    let hex_bytes: Vec<u8> = key_str
+                        .split_whitespace()
+                        .filter_map(|s| u8::from_str_radix(s, 16).ok())
+                        .collect();
+
+                    if hex_bytes.len() >= 8 {
+                        let ip = format!("{}.{}.{}.{}", hex_bytes[4], hex_bytes[5], hex_bytes[6], hex_bytes[7]);
+                        banned_ips.push(ip);
                     }
                 }
             }
@@ -113,17 +164,14 @@ fn get_ebpf_active_blocks() -> Vec<String> {
 }
 
 fn main() -> io::Result<()> {
+    let mut db_file: Option<File> = None;
+    let mut db_pos: u64 = 0;
+    let mut events: Vec<AuditEvent> = Vec::new();
+
     loop {
-        print!("\x1B[2J\x1B[1;1H");
-        io::stdout().flush()?;
+        let _ = read_new_events(&mut db_file, &mut db_pos, &mut events);
 
-        println!("==================================================================");
-        println!("       SOKOL-CORE: RUST NATIVE SECURITY & EBPF TELEMETRY         ");
-        println!("==================================================================");
-
-        let events = parse_db().unwrap_or_default();
         let total_attacks = events.len();
-
         let mut unique_ips = HashMap::new();
         let mut tiers_counter = HashMap::new();
 
@@ -133,6 +181,13 @@ fn main() -> io::Result<()> {
         }
 
         let ebpf_blocks = get_ebpf_active_blocks();
+
+        print!("\x1B[H\x1B[2J");
+        io::stdout().flush()?;
+
+        println!("==================================================================");
+        println!("       SOKOL-CORE: RUST NATIVE SECURITY & EBPF TELEMETRY         ");
+        println!("==================================================================");
 
         println!("[*] Total Intercepted Attacks (sntl_db) : {}", total_attacks);
         println!("[*] Unique Attacker IPs Logged         : {}", unique_ips.len());
@@ -152,18 +207,20 @@ fn main() -> io::Result<()> {
             println!("    {:<25} : {}", tier, count);
         }
 
-        println!("\n--- Recent Audit Events (sntl_db) ---");
-        println!("{:<6} | {:<15} | {:<25} | {:<10}", "PAGE", "IP ADDRESS", "TRIDENT TIER", "LEN (B)");
-        println!("{}", "-".repeat(65));
+        println!("\n--- Live Captured Attack Payloads (sntl_db) ---");
+        println!("{:<6} | {:<15} | {:<18} | {:<6} | {:<20}", "PAGE", "IP ADDRESS", "TIER", "LEN", "PAYLOAD SNIPPET");
+        println!("{}", "-".repeat(78));
 
-        let start = if total_attacks > 8 { total_attacks - 8 } else { 0 };
+        let start = events.len().saturating_sub(8);
+
         for ev in &events[start..] {
-            let tier_truncated: String = ev.tier.chars().take(23).collect();
-            println!("{:<6} | {:<15} | {:<25} | {:<10}", 
+            println!(
+                "{:<6} | {:<15} | {:<18.18} | {:<6} | {:<20.20}", 
                 ev.page_id, 
                 ev.ip, 
-                tier_truncated, 
-                ev.payload_len
+                ev.tier, 
+                ev.payload_len,
+                ev.payload_snippet
             );
         }
 

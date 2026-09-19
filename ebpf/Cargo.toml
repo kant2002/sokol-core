@@ -4,21 +4,25 @@ version = "0.1.0"
 edition = "2021"
 
 [[bin]]
-name = "ebpf_probe"
+name = "ebpf-probe"
 path = "src/main.rs"
 test = false
 
 [dependencies]
 aya-ebpf = "0.1.1"
-common = { path = "../common" }
+common = { path = "../common", default-features = false }
+
+[unstable]
+build-std = ["core", "alloc"]
+
+[build]
+target = "bpfel-unknown-none"
+
 
 [profile.dev]
+opt-level = 3
 panic = "abort"
-debug = true
 
 [profile.release]
-opt-level = 2
-strip = true
-lto = true
-codegen-units = 1
+opt-level = 3
 panic = "abort"

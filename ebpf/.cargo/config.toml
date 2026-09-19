@@ -1,5 +1,5 @@
-[target.bpfel-unknown-none]
-linker = "bpf-linker"
+[build]
+target = "bpfel-unknown-none"
 
 [unstable]
 build-std = ["core", "alloc"]

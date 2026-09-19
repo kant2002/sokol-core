@@ -2,13 +2,18 @@
 #![no_main]
 
 use aya_ebpf::{
-    macros::{map, tc},
+    bindings::xdp_action,
+    macros::{map, xdp},
     maps::LruHashMap,
-    programs::TcContext,
-    bindings::{TC_ACT_OK, TC_ACT_SHOT},
+    programs::XdpContext,
 };
+use core::mem;
 
 const ETH_P_IP: u16 = 0x0800;
+const IP_MF: u16 = 0x2000;
+const IP_OFFSET_MASK: u16 = 0x1FFF;
+const MAX_FRAGS_PER_WINDOW: u32 = 64;
+const WINDOW_NS: u64 = 5_000_000_000;
 
 #[repr(C, packed)]
 #[derive(Clone, Copy)]
@@ -33,101 +38,105 @@ pub struct IpHdr {
     pub dst_addr: u32,
 }
 
-#[repr(C)]
+#[repr(C, align(4))]
 #[derive(Clone, Copy)]
 pub struct FragKey {
     pub src_addr: u32,
-    pub dst_addr: u32,
-    pub id: u16,
 }
 
 unsafe impl aya_ebpf::Pod for FragKey {}
 
-#[repr(C)]
+#[repr(C, align(8))]
 #[derive(Clone, Copy)]
 pub struct FragValue {
-    pub pkt_count: u32,
     pub first_seen_ns: u64,
+    pub pkt_count: u32,
+    pub _pad: u32,
 }
 
 unsafe impl aya_ebpf::Pod for FragValue {}
 
 #[map]
-static FRAG_TABLE: LruHashMap<FragKey, FragValue> = LruHashMap::with_max_entries(16384, 0);
+static FRAG_RATE_MAP: LruHashMap<FragKey, FragValue> = LruHashMap::with_max_entries(16384, 0);
 
 #[inline(always)]
-fn ptr_at<T>(ctx: &TcContext, offset: usize) -> Result<*const T, ()> {
-    let start = ctx.data();
-    let end = ctx.data_end();
-    let len = core::mem::size_of::<T>();
+fn ptr_at<T>(ctx: &XdpContext, offset: usize) -> Result<*const T, ()> {
+    let start = ctx.data() as usize;
+    let end = ctx.data_end() as usize;
+    let len = mem::size_of::<T>();
 
-    if start + offset + len > end {
-        return Err(());
+    if start.checked_add(offset).and_then(|v| v.checked_add(len)).is_some() {
+        if start + offset + len <= end {
+            return Ok((start + offset) as *const T);
+        }
     }
-    Ok((start + offset) as *const T)
+    Err(())
 }
 
-#[tc]
-pub fn sentinel_vfr_tc(ctx: TcContext) -> i32 {
-    match try_sentinel_vfr_tc(&ctx) {
+#[xdp]
+pub fn sentinel_frag_filter(ctx: XdpContext) -> u32 {
+    match try_sentinel_frag_filter(&ctx) {
         Ok(ret) => ret,
-        Err(_) => TC_ACT_OK,
+        Err(_) => xdp_action::XDP_PASS,
     }
 }
 
 #[inline(always)]
-fn try_sentinel_vfr_tc(ctx: &TcContext) -> Result<i32, ()> {
+fn try_sentinel_frag_filter(ctx: &XdpContext) -> Result<u32, ()> {
     let eth_ptr = ptr_at::<EthHdr>(ctx, 0)?;
     let raw_eth_type = unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*eth_ptr).ether_type)) };
-    let eth_type = u16::from_be(raw_eth_type);
-
-    if eth_type != ETH_P_IP {
-        return Ok(TC_ACT_OK);
+    if u16::from_be(raw_eth_type) != ETH_P_IP {
+        return Ok(xdp_action::XDP_PASS);
     }
 
-    let ip_offset = core::mem::size_of::<EthHdr>();
-    let ip_ptr = ptr_at::<IpHdr>(ctx, ip_offset)?;
+    let ip_offset = mem::size_of::<EthHdr>();
+    let ip_ptr = match ptr_at::<IpHdr>(ctx, ip_offset) {
+        Ok(ptr) => ptr,
+        Err(_) => return Ok(xdp_action::XDP_DROP),
+    };
+
+    let version_ihl = unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*ip_ptr).version_ihl)) };
+    let version = version_ihl >> 4;
+    let ihl_bytes = ((version_ihl & 0x0F) * 4) as usize;
+
+    if version != 4 || ihl_bytes < 20 || (ctx.data() as usize) + ip_offset + ihl_bytes > (ctx.data_end() as usize) {
+        return Ok(xdp_action::XDP_DROP);
+    }
 
     let frag_off_raw = unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*ip_ptr).frag_off)) };
     let frag_off = u16::from_be(frag_off_raw);
 
-    const IP_MF: u16 = 0x2000;
-    const IP_OFFSET: u16 = 0x1FFF;
-
-    if (frag_off & IP_MF) != 0 || (frag_off & IP_OFFSET) != 0 {
+    if (frag_off & (IP_MF | IP_OFFSET_MASK)) != 0 {
         let src_addr = unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*ip_ptr).src_addr)) };
-        let dst_addr = unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*ip_ptr).dst_addr)) };
-        let id = unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*ip_ptr).id)) };
         let current_time = unsafe { aya_ebpf::helpers::bpf_ktime_get_ns() };
 
-        let key = FragKey { src_addr, dst_addr, id };
+        let key = FragKey { src_addr };
 
-        if let Some(val_ptr) = FRAG_TABLE.get_ptr_mut(&key) {
+        if let Some(val_ptr) = FRAG_RATE_MAP.get_ptr_mut(&key) {
             unsafe {
-    
-                if current_time - (*val_ptr).first_seen_ns > 5_000_000_000 {
-                    (*val_ptr).pkt_count = 1;
-                    (*val_ptr).first_seen_ns = current_time;
+                let val = &mut *val_ptr;
+
+                if current_time.saturating_sub(val.first_seen_ns) > WINDOW_NS {
+                    val.first_seen_ns = current_time;
+                    val.pkt_count = 1;
                 } else {
-                    (*val_ptr).pkt_count += 1;
-                    if (*val_ptr).pkt_count > 64 {
-                        return Ok(TC_ACT_SHOT);
+                    val.pkt_count = val.pkt_count.saturating_add(1);
+                    if val.pkt_count > MAX_FRAGS_PER_WINDOW {
+                        return Ok(xdp_action::XDP_DROP);
                     }
                 }
             }
         } else {
-            let _ = FRAG_TABLE.insert(
-                &key,
-                &FragValue {
-                    pkt_count: 1,
-                    first_seen_ns: current_time,
-                },
-                0,
-            );
+            let val = FragValue {
+                first_seen_ns: current_time,
+                pkt_count: 1,
+                _pad: 0,
+            };
+            let _ = FRAG_RATE_MAP.insert(&key, &val, 0);
         }
     }
 
-    Ok(TC_ACT_OK)
+    Ok(xdp_action::XDP_PASS)
 }
 
 #[cfg(not(test))]

@@ -1,27 +1,20 @@
-use tokio::net::{TcpListener, TcpStream};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::time::{sleep, Duration, timeout};
-use std::path::Path;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-
-#[link(name = "sntl_db", kind = "static")]
-extern "C" {
-    fn sntl_db_init(path_ptr: *const u8, path_len: usize) -> bool;
-    fn sntl_db_append_request(data_ptr: *const u8, data_len: usize) -> u64;
-    fn sntl_db_flag_high_value_target(ip_ptr: *const u8, ip_len: usize) -> bool;
-}
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::time::{sleep, timeout, Duration};
 
 pub struct UltimateTridentOrchestrator {
-    db_path: String,
+    #[allow(dead_code)]
+    pub db_path: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum TridentTier {
-    Tier1BotTarpit,     
-    Tier1_5Revenge,     
-    Tier2AptSandbox,    
-    Tier3InteractiveJail, 
+    Tier1BotTarpit,
+    Tier1_5Revenge,
+    Tier2AptSandbox,
+    Tier3InteractiveJail,
 }
 
 pub struct ConnectionFingerprint {
@@ -34,21 +27,33 @@ pub struct ConnectionFingerprint {
     pub snippet: String,
 }
 
+impl ConnectionFingerprint {
+    pub fn empty(ip: &str, port: u16) -> Self {
+        Self {
+            ip: ip.to_string(),
+            port,
+            payload_len: 0,
+            entropy: 0.0,
+            non_printable_ratio: 0.0,
+            fingerprint_hash: 0,
+            snippet: String::new(),
+        }
+    }
+}
+
 impl UltimateTridentOrchestrator {
     pub fn new(db_path: &str) -> Self {
-        Self { db_path: db_path.to_string() }
+        Self {
+            db_path: db_path.to_string(),
+        }
     }
 
     pub async fn run(&self, ports: &[u16]) -> Result<(), Box<dyn std::error::Error>> {
-        let init_ok = unsafe { sntl_db_init(self.db_path.as_ptr(), self.db_path.len()) };
-        if !init_ok {
-            eprintln!("[!] Warning: sntl_db initialization failed.");
-        }
+        println!("[*] Sokol-Core Trident Node initializing (Single-Writer via Unix Socket)...");
 
         let mut handles = vec![];
 
         for &port in ports {
-            let db_path = self.db_path.clone();
             let addr = format!("0.0.0.0:{}", port);
 
             let handle = tokio::spawn(async move {
@@ -66,10 +71,9 @@ impl UltimateTridentOrchestrator {
                 while let Ok((stream, peer_addr)) = listener.accept().await {
                     let ip = peer_addr.ip().to_string();
                     let peer_port = peer_addr.port();
-                    let db_path_clone = db_path.clone();
 
                     tokio::spawn(async move {
-                        if let Err(e) = handle_trident_connection(stream, ip, peer_port, &db_path_clone).await {
+                        if let Err(e) = handle_trident_connection(stream, ip, peer_port).await {
                             let _ = e;
                         }
                     });
@@ -91,19 +95,15 @@ async fn handle_trident_connection(
     mut stream: TcpStream,
     ip: String,
     port: u16,
-    _db_path: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut buf = vec![0u8; 2048];
-    
-    let read_result = timeout(
-        Duration::from_secs(5),
-        stream.read(&mut buf)
-    ).await;
+
+    let read_result = timeout(Duration::from_secs(5), stream.read(&mut buf)).await;
 
     let n = match read_result {
         Ok(Ok(n)) if n > 0 => n,
         _ => {
-            trigger_xdp_drop(&ip).await;
+            let _ = trigger_xdp_drop(&ip).await;
             let _ = stream.shutdown().await;
             return Ok(());
         }
@@ -125,31 +125,37 @@ async fn handle_trident_connection(
         fingerprint.snippet
     );
 
-    unsafe {
-        sntl_db_append_request(unique_log_record.as_ptr(), unique_log_record.len());
-    }
+    let _ = send_log_to_orchestrator(&unique_log_record).await;
 
     match tier {
         TridentTier::Tier1BotTarpit => {
-            println!("[TIER-1] Bot/Scanner detected from IP: {} on port {} | Hash: {:016X}", ip, port, fingerprint.fingerprint_hash);
+            println!(
+                "[TIER-1] Bot/Scanner detected from IP: {} on port {} | Hash: {:016X}",
+                ip, port, fingerprint.fingerprint_hash
+            );
             run_tier1_bot_tarpit(stream, &ip).await?;
         }
         TridentTier::Tier1_5Revenge => {
-            println!("[TIER-1.5 REVENGE] Binary garbage flood from IP: {} on port {} | Counter-strike active!", ip, port);
+            println!(
+                "[TIER-1.5 REVENGE] Binary garbage flood from IP: {} on port {} | Counter-strike active!",
+                ip, port
+            );
             run_counter_strike_revenge(stream, &ip, fingerprint.fingerprint_hash).await?;
         }
         TridentTier::Tier2AptSandbox => {
-            println!("[TIER-2 APT ALERT] High-value target / Stager detected from IP: {} on port {}! Vacuuming payload...", ip, port);
-            
-            unsafe {
-                sntl_db_flag_high_value_target(ip.as_ptr(), ip.len());
-            }
-            notify_ebpf_kernel_apt(&ip).await;
+            println!(
+                "[TIER-2 APT ALERT] High-value target / Stager detected from IP: {} on port {}! Vacuuming payload...",
+                ip, port
+            );
 
+            let _ = notify_ebpf_kernel_apt(&ip).await;
             run_tier2_apt_sandbox(stream, payload, &ip).await?;
         }
         TridentTier::Tier3InteractiveJail => {
-            println!("[TIER-3 JAIL] SSH interaction detected from IP: {} on port {}! Engaging bait and proxying to Jail...", ip, port);
+            println!(
+                "[TIER-3 JAIL] SSH interaction detected from IP: {} on port {}! Engaging bait and proxying to Jail...",
+                ip, port
+            );
             run_tier3_interactive_jail(stream, payload, &ip).await?;
         }
     }
@@ -162,7 +168,6 @@ fn classify_traffic_tier(payload: &[u8], fp: &ConnectionFingerprint) -> TridentT
         return TridentTier::Tier1BotTarpit;
     }
 
-    
     if payload.starts_with(b"SSH-2.0-") || fp.port == 22 {
         return TridentTier::Tier3InteractiveJail;
     }
@@ -183,14 +188,18 @@ fn classify_traffic_tier(payload: &[u8], fp: &ConnectionFingerprint) -> TridentT
 }
 
 fn analyze_and_fingerprint(ip: &str, port: u16, payload: &[u8]) -> ConnectionFingerprint {
-    let payload_len = payload.len();
-    let non_printable = payload.iter().filter(|&&b| b < 32 || b > 126).count();
-    let non_printable_ratio = if payload_len > 0 {
-        non_printable as f64 / payload_len as f64
-    } else {
-        0.0
-    };
+    if payload.is_empty() {
+        return ConnectionFingerprint::empty(ip, port);
+    }
 
+    let payload_len = payload.len();
+
+    let non_printable = payload
+        .iter()
+        .filter(|&&b| !b.is_ascii_graphic() && !b.is_ascii_whitespace())
+        .count();
+
+    let non_printable_ratio = non_printable as f64 / payload_len as f64;
     let entropy = calculate_shannon_entropy(payload);
 
     let mut hasher = DefaultHasher::new();
@@ -198,7 +207,7 @@ fn analyze_and_fingerprint(ip: &str, port: u16, payload: &[u8]) -> ConnectionFin
     ip.hash(&mut hasher);
     let fingerprint_hash = hasher.finish();
 
-    let snippet = String::from_utf8_lossy(&payload[..payload.len().min(32)])
+    let snippet = String::from_utf8_lossy(&payload[..payload_len.min(32)])
         .chars()
         .filter(|c| c.is_ascii_graphic() || *c == ' ')
         .collect::<String>();
@@ -233,13 +242,18 @@ fn calculate_shannon_entropy(data: &[u8]) -> f64 {
     entropy
 }
 
-async fn run_tier1_bot_tarpit(mut stream: TcpStream, ip: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let _ = stream.write_all(
-        b"HTTP/1.1 200 OK\r\n\
+async fn run_tier1_bot_tarpit(
+    mut stream: TcpStream,
+    ip: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let _ = stream
+        .write_all(
+            b"HTTP/1.1 200 OK\r\n\
         Server: nginx/1.18.0\r\n\
         Content-Type: text/html\r\n\
-        Transfer-Encoding: chunked\r\n\r\n"
-    ).await;
+        Transfer-Encoding: chunked\r\n\r\n",
+        )
+        .await;
 
     for i in 0..120 {
         let chunk_data = format!("<div>Diagnostic block ID: {} - Synchronizing state...</div>\n", i);
@@ -251,12 +265,16 @@ async fn run_tier1_bot_tarpit(mut stream: TcpStream, ip: &str) -> Result<(), Box
         sleep(Duration::from_millis(150)).await;
     }
     let _ = stream.write_all(b"0\r\n\r\n").await;
-    trigger_xdp_drop(ip).await;
+    let _ = trigger_xdp_drop(ip).await;
     let _ = stream.shutdown().await;
     Ok(())
 }
 
-async fn run_counter_strike_revenge(mut stream: TcpStream, ip: &str, seed_hash: u64) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_counter_strike_revenge(
+    mut stream: TcpStream,
+    ip: &str,
+    seed_hash: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
     let mut rng_chunk = [0u8; 4096];
     let mut seed: u64 = seed_hash ^ 0xDEADBEEFCAFEBABE;
 
@@ -273,28 +291,29 @@ async fn run_counter_strike_revenge(mut stream: TcpStream, ip: &str, seed_hash: 
         let _ = stream.flush().await;
     }
 
-    trigger_xdp_drop(ip).await;
+    let _ = trigger_xdp_drop(ip).await;
     let _ = stream.shutdown().await;
     Ok(())
 }
 
-async fn run_tier2_apt_sandbox(mut stream: TcpStream, initial_payload: &[u8], ip: &str) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_tier2_apt_sandbox(
+    mut stream: TcpStream,
+    initial_payload: &[u8],
+    ip: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
     let mut stager_storage = initial_payload.to_vec();
     let mut buf = vec![0u8; 4096];
 
     loop {
-        let read_res = timeout(
-            Duration::from_secs(8),
-            stream.read(&mut buf)
-        ).await;
+        let read_res = timeout(Duration::from_secs(8), stream.read(&mut buf)).await;
 
         match read_res {
             Ok(Ok(0)) | Err(_) => break,
             Ok(Ok(n)) => {
                 stager_storage.extend_from_slice(&buf[..n]);
-                
+
                 let chunk_log = format!("STAGER_CHUNK|IP={}|BYTES={}", ip, n);
-                unsafe { sntl_db_append_request(chunk_log.as_ptr(), chunk_log.len()); }
+                let _ = send_log_to_orchestrator(&chunk_log).await;
 
                 if stager_storage.len() > 2 * 1024 * 1024 {
                     break;
@@ -304,83 +323,215 @@ async fn run_tier2_apt_sandbox(mut stream: TcpStream, initial_payload: &[u8], ip
         }
     }
 
-    println!("[TIER-2] Successfully vacuumed {} bytes of stager payload from APT operator {}.", stager_storage.len(), ip);
-    
-    let _ = stream.write_all(b"\x7fELF\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00").await;
+    println!(
+        "[TIER-2] Successfully vacuumed {} bytes of stager payload from APT operator {}.",
+        stager_storage.len(),
+        ip
+    );
+
+    let _ = stream
+        .write_all(b"\x7fELF\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00")
+        .await;
     let _ = stream.flush().await;
-    
-    trigger_xdp_drop(ip).await;
+
+    let _ = trigger_xdp_drop(ip).await;
     let _ = stream.shutdown().await;
     Ok(())
 }
 
 async fn run_tier3_interactive_jail(
-    mut attacker_stream: TcpStream, 
+    mut attacker_stream: TcpStream,
     initial_payload: &[u8],
-    ip: &str
+    ip: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let jail_addr = "127.0.0.1:2222"; 
+    let jail_addr = "127.0.0.1:2222";
 
-    
-    let juicy_bait_banner = b"SSH-2.0-OpenSSH_7.4p1 Debian-10+deb9u7\r\n";
-    if attacker_stream.write_all(juicy_bait_banner).await.is_err() {
-        return Ok(());
-    }
-    let _ = attacker_stream.flush().await;
+    match TcpStream::connect(jail_addr).await {
+        Ok(mut jail_stream) => {
+            let juicy_bait_banner = b"SSH-2.0-OpenSSH_7.4p1 Debian-10+deb9u7\r\n";
+            if attacker_stream.write_all(juicy_bait_banner).await.is_ok() {
+                let _ = attacker_stream.flush().await;
 
-    
-    let mut jail_stream = match tokio::net::TcpStream::connect(jail_addr).await {
-        Ok(stream) => stream,
+                if !initial_payload.is_empty() {
+                    let _ = jail_stream.write_all(initial_payload).await;
+                }
+
+                if let Ok((from_attacker, from_jail)) =
+                    tokio::io::copy_bidirectional(&mut attacker_stream, &mut jail_stream).await
+                {
+                    println!(
+                        "[TIER-3 JAIL] Session ended for {}. Attacker sent {} bytes, Jail replied with {} bytes.",
+                        ip, from_attacker, from_jail
+                    );
+                    let session_log = format!(
+                        "JAIL_SESSION_END|IP={}|IN={}|OUT={}",
+                        ip, from_attacker, from_jail
+                    );
+                    let _ = send_log_to_orchestrator(&session_log).await;
+                }
+            }
+        }
         Err(_) => {
-            println!("[!] Jail container is down! Dropping attacker {}.", ip);
-            trigger_xdp_drop(ip).await;
-            return Ok(());
+            let _ = run_embedded_mock_jail(&mut attacker_stream, initial_payload, ip).await;
         }
     };
 
-    if !initial_payload.is_empty() {
-        if jail_stream.write_all(initial_payload).await.is_err() {
-            return Ok(());
-        }
-    }
-
-    
-    match tokio::io::copy_bidirectional(&mut attacker_stream, &mut jail_stream).await {
-        Ok((from_attacker, from_jail)) => {
-            println!(
-                "[TIER-3 JAIL] Session ended for {}. Attacker sent {} bytes, Jail replied with {} bytes.",
-                ip, from_attacker, from_jail
-            );
-            
-            let session_log = format!("JAIL_SESSION_END|IP={}|IN={}|OUT={}", ip, from_attacker, from_jail);
-            unsafe { sntl_db_append_request(session_log.as_ptr(), session_log.len()); }
-        }
-        Err(e) => eprintln!("[!] Jail proxy error for {}: {}", ip, e),
-    }
-
-    trigger_xdp_drop(ip).await;
+    let _ = trigger_xdp_drop(ip).await;
+    let _ = attacker_stream.shutdown().await;
     Ok(())
 }
 
-async fn notify_ebpf_kernel_apt(ip: &str) {
+async fn run_embedded_mock_jail(
+    stream: &mut TcpStream,
+    initial_payload: &[u8],
+    ip: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    println!(
+        "[TIER-3 EMBEDDED TRAP] External jail offline. Engaging internal Async Mock Jail for IP: {}",
+        ip
+    );
+
+    if stream
+        .write_all(b"SSH-2.0-OpenSSH_8.2p1 Ubuntu-4ubuntu0.5\r\n")
+        .await
+        .is_err()
+    {
+        return Ok(());
+    }
+    let _ = stream.flush().await;
+
+    let mut buf = vec![0u8; 1024];
+    let mut captured_data = initial_payload.to_vec();
+
+    loop {
+        let read_res = timeout(Duration::from_secs(8), stream.read(&mut buf)).await;
+        match read_res {
+            Ok(Ok(0)) | Err(_) => break,
+            Ok(Ok(n)) => {
+                captured_data.extend_from_slice(&buf[..n]);
+
+                let snippet = String::from_utf8_lossy(&buf[..n.min(32)])
+                    .chars()
+                    .filter(|c| c.is_ascii_graphic() || *c == ' ')
+                    .collect::<String>();
+
+                let chunk_log = format!("EMBEDDED_JAIL_INPUT|IP={}|BYTES={}|SNIPPET={}", ip, n, snippet);
+                let _ = send_log_to_orchestrator(&chunk_log).await;
+
+                if stream
+                    .write_all(b"Permission denied (publickey,password).\r\nlogin: ")
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                let _ = stream.flush().await;
+
+                if captured_data.len() > 1024 * 1024 {
+                    break;
+                }
+            }
+            Ok(Err(_)) => break,
+        }
+    }
+
+    let final_log = format!(
+        "EMBEDDED_TRAP_FINALISED|IP={}|TOTAL_CAPTURED={}",
+        ip,
+        captured_data.len()
+    );
+    let _ = send_log_to_orchestrator(&final_log).await;
+    println!(
+        "[TIER-3 EMBEDDED TRAP] Vacuumed {} bytes of interactive input from {}.",
+        captured_data.len(),
+        ip
+    );
+
+    Ok(())
+}
+
+async fn send_log_to_orchestrator(log_msg: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let socket_path = "/run/sokol.sock";
-    if Path::new(socket_path).exists() {
-        if let Ok(mut socket) = tokio::net::UnixStream::connect(socket_path).await {
-            let msg = format!("APT_HIGH_PRIORITY:{}\n", ip);
-            let _ = socket.write_all(msg.as_bytes()).await;
+    let msg = format!("DB_LOG:{}\n", log_msg);
+
+    match tokio::net::UnixStream::connect(socket_path).await {
+        Ok(mut socket) => {
+            socket.write_all(msg.as_bytes()).await?;
+            socket.flush().await?;
+            let _ = socket.shutdown().await;
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("[WARN] Failed to write audit log to IPC: {}", e);
+            Err(e.into())
         }
     }
 }
 
-async fn trigger_xdp_drop(ip: &str) {
+async fn notify_ebpf_kernel_apt(ip: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let socket_path = "/run/sokol.sock";
-    if Path::new(socket_path).exists() {
-        if let Ok(mut socket) = tokio::net::UnixStream::connect(socket_path).await {
-            let msg = format!("DROP_IMMEDIATE:{}\n", ip);
-            let _ = socket.write_all(msg.as_bytes()).await;
-            println!("[XDP_ACTION] IP {} permanently banned via eBPF XDP map.", ip);
+    let msg = format!("APT_HIGH_PRIORITY:{}\n", ip);
+
+    match tokio::net::UnixStream::connect(socket_path).await {
+        Ok(mut socket) => {
+            socket.write_all(msg.as_bytes()).await?;
+            socket.flush().await?;
+            let _ = socket.shutdown().await;
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("\x1b[1;31m[CRITICAL]\x1b[0m APT Notification failed for IP {}: {}", ip, e);
+            Err(e.into())
         }
     }
+}
+
+async fn trigger_xdp_drop(ip: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let socket_path = "/run/sokol.sock";
+    let msg = format!("DROP_IMMEDIATE:{}\n", ip);
+    let max_retries = 3;
+    let mut retry_delay = Duration::from_millis(50);
+
+    for attempt in 1..=max_retries {
+        match tokio::net::UnixStream::connect(socket_path).await {
+            Ok(mut socket) => {
+                if let Err(e) = socket.write_all(msg.as_bytes()).await {
+                    eprintln!(
+                        "[!] IPC Write Fail (Attempt {}/{}): {}",
+                        attempt, max_retries, e
+                    );
+                } else if let Err(e) = socket.flush().await {
+                    eprintln!(
+                        "[!] IPC Flush Fail (Attempt {}/{}): {}",
+                        attempt, max_retries, e
+                    );
+                } else {
+                    let _ = socket.shutdown().await;
+                    println!("[XDP_ACTION] IP {} sent to IPC orchestrator for XDP drop.", ip);
+                    return Ok(());
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "[!] Cannot connect to Unix socket '{}' (Attempt {}/{}): {}",
+                    socket_path, attempt, max_retries, e
+                );
+            }
+        }
+
+        if attempt < max_retries {
+            sleep(retry_delay).await;
+            retry_delay *= 2;
+        }
+    }
+
+    let err_msg = format!(
+        "CRITICAL IPC FAILURE: Failed to deliver DROP_IMMEDIATE for IP {} after {} attempts. Is sokol daemon running?",
+        ip, max_retries
+    );
+    eprintln!("\x1b[1;31m[CRITICAL]\x1b[0m {}", err_msg);
+
+    Err(err_msg.into())
 }
 
 #[tokio::main]
@@ -392,6 +543,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let orchestrator = UltimateTridentOrchestrator::new("sokol_audit.sntl");
     let target_ports = vec![22, 80, 443, 3306, 6379, 8080, 8443];
     orchestrator.run(&target_ports).await?;
-    
+
     Ok(())
 }
