@@ -1,18 +1,21 @@
-
+# Build artifacts & targets
 /target/
-**/*.rs.bk
-
-/zig-cache/
 /zig-out/
-/sntl_db/zig-cache/
-/sntl_db/zig-out/
+/.zig-cache/
 
-.idea/
-.vscode/
-*.swp
-*.swo
+# Libraries & binaries
+*.a
+*.o
+*.so
+*.dll
+
+# Databases & local audit files
+*.db
+sntl.db
+sokol_audit.sntl
+monitor
+
+# Backups & editor temp files
+*.bak
+*~
 .DS_Store
-
-*.log
-*.tmp
-.env
